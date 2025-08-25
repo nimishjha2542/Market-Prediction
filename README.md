@@ -40,51 +40,84 @@ I designed and implemented an end-to-end, production-style pipeline that convert
 
 ---
 
-### Utility Metric
+## Utility Metric
 
-For each trading date \(i\):
-\[
-p_i=\sum_{j}\big(\text{weight}_{ij}\cdot \text{resp}_{ij}\cdot \text{action}_{ij}\big),\qquad
-t=\frac{\sum_i p_i}{\sqrt{\sum_i p_i^{2}}}\cdot\sqrt{\frac{250}{|i|}},\qquad
-u=\min(\max(t,0),6)\cdot\sum_i p_i.
-\]
+For each date $i$, define daily profit:
 
-**Objective:** maximize aggregate profit \(\sum_i p_i\) while maintaining low day-to-day variance (high \(t\)).
+$$
+p_i = \sum_{j}\big(\mathrm{weight}_{ij}\,\mathrm{resp}_{ij}\,\mathrm{action}_{ij}\big).
+$$
+
+Annualized Sharpe-like factor:
+
+$$
+t = \frac{\sum_{i} p_i}{\sqrt{\sum_{i} p_i^{2}}}\,\sqrt{\frac{250}{|i|}}\,.
+$$
+
+Utility:
+
+$$
+u = \min(\max(t,0),6)\,\sum_{i} p_i\,.
+$$
+
+**Objective:** maximize $\sum_{i} p_i$ while maintaining low day-to-day variance (high $t$).
+
+
 
 ---
 
 ### Architecture
 
-flowchart TB
-    %% Inputs & normalization
-    X["Inputs: feature_0..129"] --> BN0["BatchNorm (x0)"]
 
-    %% Autoencoder (trained jointly per fold)
-    subgraph AE["Autoencoder Path"]
-        BN0 --> GN["GaussianNoise (sigma ~= 0.0353)"]
-        GN --> ENC["Encoder<br/>Dense 96 -> BN -> Swish"]
-        ENC --> DEC["Decoder<br/>Dense -> Reconstruct X (130-d)"]
-        DEC --> AECLS["AE Classifier<br/>Dense 96 -> BN -> Swish -> Dropout -> Dense 5 (Sigmoid)"]
-    end
 
-    %% Main classifier (concat raw + latent)
-    ENC -->|latent z (96)| CAT(("Concat"))
-    BN0 -->|x0 (130)| CAT
-    CAT --> H1["Dense 896 -> BN -> Swish -> Dropout"]
-    H1 --> H2["Dense 448 -> BN -> Swish -> Dropout"]
-    H2 --> H3["Dense 448 -> BN -> Swish -> Dropout"]
-    H3 --> H4["Dense 256 -> BN -> Swish -> Dropout"]
-    H4 --> MAIN["Main Classifier<br/>Dense 5 (Sigmoid)"]
+![AE-MLP Architecture](assets/architecture.png)
 
-    %% Losses & selection
-    DEC --> LREC["Reconstruction: MSE, metric: MAE"]
-    AECLS --> LAE["AE Head: BCE, metric: AUC"]
-    MAIN --> LMAIN["Main Head: BCE, metric: AUC, monitored for ES/CKPT"]
+## Process
 
-    classDef block fill:#f8fafc,stroke:#334155,stroke-width:1px;
-    classDef loss  fill:#eef2ff,stroke:#1e40af,stroke-width:1px;
-    class BN0,GN,ENC,DEC,AECLS,H1,H2,H3,H4,MAIN,CAT block;
-    class LREC,LAE,LMAIN loss;
+### 1) Load & filter
+- Load `train.csv`; keep `date > 85` (remove early-regime shift) and `weight > 0` (rows that actually move the utility).
+- Extract `feature_0..feature_129`, time columns (`date`, `ts_id`), and returns (`resp`, `resp_1..resp_4`).
+
+### 2) Causal imputation
+- Forward-fill each feature using only past rows (preserves causality).
+- Fill residual missing values with `0` to ensure dense, consistent tensors for train and inference.
+
+### 3) Supervision (labels)
+- Build per-horizon binary labels: \( y_k = \mathbf{1}[\mathrm{resp}_k > 0] \), for \( k \in \{\mathrm{resp}, \mathrm{resp}_1, \mathrm{resp}_2, \mathrm{resp}_3, \mathrm{resp}_4\} \).
+- *(Optional, analysis)* Define a strict composite label equal to \(1\) iff **all** horizons are positive.
+
+### 4) Cross-validation design
+- Use **5-fold Purged Group TimeSeriesSplit** (group = `date`) with a **31-day embargo** between train/validation windows.
+- Generate **OOF predictions** per fold to support threshold tuning on held-out data.
+
+### 5) Joint training (per fold)
+- Train a **Supervised Autoencoder + MLP** within each fold so the encoder and classifier co-adapt **without cross-fold leakage**.
+  - **Encoder:** Dense 96 → BatchNorm → Swish, preceded by GaussianNoise (\( \sigma \approx 0.0353 \)).
+  - **Decoder:** reconstructs the 130-D input (**MSE** loss).
+  - **AE auxiliary head:** Dense → BatchNorm → Swish → Dropout → **5 sigmoid** (**BCE**).
+  - **Main classifier:** concat **BN(input)** with **latent (96-D)** → MLP \([896, 448, 448, 256]\) with BN/Swish/Dropout → **5 sigmoid** (**BCE**).
+- **Optimization:** Adam (lr \(=10^{-3}\)), label smoothing \(=0\), batch size \(\approx 4096\), up to \(100\) epochs; **EarlyStopping** (patience \(\approx 10\)) and **ModelCheckpoint** on **val AUC (main head)**.
+- **Independent problem-solving:** Identified potential label leakage from pretraining and **replaced it with joint per-fold training**, eliminating cross-fold information bleed.
+
+### 6) Economics-aware sample weighting
+- Compute per-row training weight: \( w_{\text{sample}} = \mathrm{mean}(|\mathrm{resp}_k|),\; k=1..5 \), and apply uniformly across outputs to emphasize **high-impact** observations.
+
+### 7) Model selection & artifacts
+- Select the **best epoch** by **validation AUC (main head)**; persist **best weights** per fold.
+- *(Optional)* Prefer models from **later folds** or use **multi-seed** training to increase stability.
+
+### 8) Inference & probability aggregation
+- For each segment, output **five horizon probabilities** from the main head.
+- **Average** across horizons; *(optional)* also average across **seeds/folds** to reduce variance.
+
+### 9) Thresholding → actions
+- Convert averaged probabilities to **`action ∈ {0,1}`** using a **calibrated cutoff**.
+- **Threshold objective:** tune the decision threshold on **OOF data** to **maximize the utility \(u\)** (not only AUC).
+  - Sweep \( \tau \in [0,1] \); compute day-wise \( p_i \), \( t \), and \( u \) on OOF predictions; select \( \tau^\* = \arg\max_{\tau} u \); **lock \( \tau^\* \)** for test.
+
+
+
+
 
 
 
