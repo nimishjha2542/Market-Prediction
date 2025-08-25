@@ -45,22 +45,23 @@ I designed and implemented an end-to-end, production-style pipeline that convert
 For each date $i$, define daily profit:
 
 $$
-p_i = \sum_{j}\big(\mathrm{weight}_{ij}\,\mathrm{resp}_{ij}\,\mathrm{action}_{ij}\big).
+p_i = \sum_{j}\left(\mathrm{weight}_{ij}\cdot \mathrm{resp}_{ij}\cdot \mathrm{action}_{ij}\right).
 $$
 
 Annualized Sharpe-like factor:
 
 $$
-t = \frac{\sum_{i} p_i}{\sqrt{\sum_{i} p_i^{2}}}\,\sqrt{\frac{250}{|i|}}\,.
+t = \frac{\sum_{i} p_i}{\sqrt{\sum_{i} p_i^{2}}}\,\sqrt{\frac{250}{|i|}} \, .
 $$
 
 Utility:
 
 $$
-u = \min(\max(t,0),6)\,\sum_{i} p_i\,.
+u = \min\!\big(\max(t,0),6\big)\,\sum_{i} p_i \, .
 $$
 
 **Objective:** maximize $\sum_{i} p_i$ while maintaining low day-to-day variance (high $t$).
+
 
 
 
